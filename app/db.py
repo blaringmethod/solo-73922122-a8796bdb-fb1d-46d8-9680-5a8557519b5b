@@ -3,6 +3,14 @@
 All multi-step state changes happen inside BEGIN IMMEDIATE transactions so
 that two app instances sharing the same database file are fully serialized.
 This is what makes "only one concurrent replacement succeeds" work.
+
+Ownership model: a rolling replacement can briefly run two processes under
+the same VCF_INSTANCE_ID, so every per-process row here is owned by a unique
+process-boot token (`boot_id`), never by the configured instance id. A
+process heartbeats, pins and unregisters only its own boot_id, and the
+reaper judges liveness per boot — the old process exiting cannot drop the
+replacement's pins, and the replacement's startup cannot disturb the old
+process's staging.
 """
 from __future__ import annotations
 
@@ -24,14 +32,16 @@ CREATE TABLE IF NOT EXISTS versions (
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS refs (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    version   INTEGER NOT NULL,
-    instance  TEXT NOT NULL,
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    version    INTEGER NOT NULL,
+    instance   TEXT NOT NULL,      -- configured VCF_INSTANCE_ID (informational)
+    boot_id    TEXT NOT NULL,      -- owning process boot
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS instances (
-    id        TEXT PRIMARY KEY,
-    last_seen REAL NOT NULL
+    boot_id    TEXT PRIMARY KEY,   -- one row per process boot
+    instance   TEXT NOT NULL,      -- configured VCF_INSTANCE_ID (informational)
+    last_seen  REAL NOT NULL
 );
 """
 
@@ -110,13 +120,16 @@ class Store:
         finally:
             con.close()
 
-    def live_instances(self, now: float, dead_after: float) -> set:
+    def live_boots(self, now: float, dead_after: float) -> set:
+        """Boot ids whose heartbeat is still fresh."""
         con = self._connect()
         try:
             cutoff = now - dead_after
             return {
-                r["id"]
-                for r in con.execute("SELECT id FROM instances WHERE last_seen >= ?", (cutoff,))
+                r["boot_id"]
+                for r in con.execute(
+                    "SELECT boot_id FROM instances WHERE last_seen >= ?", (cutoff,)
+                )
             }
         finally:
             con.close()
@@ -142,12 +155,14 @@ class Store:
 
     # ------------------------------------------------------------------ refs
 
-    def pin(self, instance_id: str, now: float | None = None):
+    def pin(self, instance_id: str, boot_id: str, now: float | None = None):
         """Pin the current version for an in-flight query.
 
         Returns (version, chrom, path, ref_id) or None when nothing is published.
         The read of the current pointer and the ref insert are one transaction,
-        so the reaper can never delete a version between the two steps.
+        so the reaper can never delete a version between the two steps. The pin
+        is owned by this process boot only: another process exiting — even one
+        sharing our configured instance id — cannot release it.
         """
         now = time.time() if now is None else now
         with self._txn() as con:
@@ -160,8 +175,9 @@ class Store:
             if row is None:  # pragma: no cover - defensive, should not happen
                 return None
             c = con.execute(
-                "INSERT INTO refs(version, instance, created_at) VALUES (?, ?, ?)",
-                (cur, instance_id, now),
+                "INSERT INTO refs(version, instance, boot_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (cur, instance_id, boot_id, now),
             )
             return cur, row["chrom"], row["path"], c.lastrowid
 
@@ -171,24 +187,29 @@ class Store:
 
     # ------------------------------------------------------------------ heartbeat
 
-    def heartbeat(self, instance_id: str, now: float | None = None) -> None:
+    def heartbeat(self, boot_id: str, instance_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
         with self._txn() as con:
             con.execute(
-                "INSERT INTO instances(id, last_seen) VALUES (?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen",
-                (instance_id, now),
+                "INSERT INTO instances(boot_id, instance, last_seen) VALUES (?, ?, ?) "
+                "ON CONFLICT(boot_id) DO UPDATE SET last_seen = excluded.last_seen",
+                (boot_id, instance_id, now),
             )
 
-    def unregister(self, instance_id: str) -> None:
+    def unregister(self, boot_id: str) -> None:
+        """Release everything owned by this boot — and nothing else.
+
+        A replaced process exiting must not drop the replacement's pins or
+        heartbeat row, even when both share the configured instance id.
+        """
         with self._txn() as con:
-            con.execute("DELETE FROM refs WHERE instance = ?", (instance_id,))
-            con.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
+            con.execute("DELETE FROM refs WHERE boot_id = ?", (boot_id,))
+            con.execute("DELETE FROM instances WHERE boot_id = ?", (boot_id,))
 
     # ------------------------------------------------------------------ reaper
 
     def reap_metadata(self, now: float, dead_after: float):
-        """Drop refs of dead instances and delete rows of reclaimable versions.
+        """Drop refs of dead boots and delete rows of reclaimable versions.
 
         A version is reclaimable when it is not the current one and no live
         ref points at it. Returns [(version, path)] whose files the caller
@@ -197,8 +218,8 @@ class Store:
         with self._txn() as con:
             cutoff = now - dead_after
             con.execute(
-                "DELETE FROM refs WHERE instance NOT IN "
-                "(SELECT id FROM instances WHERE last_seen >= ?)",
+                "DELETE FROM refs WHERE boot_id NOT IN "
+                "(SELECT boot_id FROM instances WHERE last_seen >= ?)",
                 (cutoff,),
             )
             cur = int(con.execute("SELECT v FROM meta WHERE k = 'current_version'").fetchone()["v"])

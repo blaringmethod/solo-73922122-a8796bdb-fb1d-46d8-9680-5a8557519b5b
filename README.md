@@ -10,12 +10,20 @@ replacement and safe concurrent access from two app instances.
 docker compose up --build
 ```
 
-Two instances come up sharing one data volume:
+Two instances come up sharing one data volume — and deliberately sharing one
+`VCF_INSTANCE_ID`, which is exactly the overlap window of a rolling
+replacement:
 
 - instance 1: http://localhost:8001/docs
 - instance 2: http://localhost:8002/docs
 
-Both serve the same published data; uploads may go to either one.
+Both serve the same published data; uploads may go to either one. To rehearse
+a rolling replacement, rebuild/restart one container while the other keeps
+serving:
+
+```bash
+docker compose up -d --no-deps --build app1
+```
 
 ## API
 
@@ -62,16 +70,24 @@ Current published version, chromosome and record count.
   opening files. A background reaper deletes a superseded version's data and
   index only when no pin references it. Instances heartbeat; pins of crashed
   instances expire and never block reclamation.
+- **Rolling replacement**: the old and new processes may briefly share one
+  `VCF_INSTANCE_ID`, so every per-process resource — staging directory,
+  heartbeat row, query pin — is owned by a unique per-boot token, not by the
+  configured instance id. The new process's startup creates only its own
+  fresh staging dir and never deletes the old process's in-flight upload;
+  the old process's shutdown releases only its own pins and heartbeat row,
+  so the replacement's in-flight queries read their pinned version to the
+  end. Either side can upload and query immediately throughout the handover.
 - **Crash recovery**: if the process dies mid-build or mid-publish, the
-  staging/orphan directories left behind are swept (with a grace period) and
-  the previously published version keeps serving. The pointer flip is the last
-  step, so a restart never exposes a partial file set.
+  staging/orphan directories left behind are swept (with a 60 s grace
+  period) and the previously published version keeps serving. The pointer
+  flip is the last step, so a restart never exposes a partial file set.
 
 ## Local development
 
 ```bash
 pip install -r requirements.txt
-python -m pytest tests/          # 36 tests
+python -m pytest tests/          # 41 tests
 uvicorn --factory app.main:create_app   # single dev instance (uses /data or $VCF_DATA_DIR)
 ```
 

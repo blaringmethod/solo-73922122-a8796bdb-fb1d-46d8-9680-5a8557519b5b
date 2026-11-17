@@ -50,8 +50,8 @@ def test_old_query_reads_old_version_then_files_reclaimed(client, app):
     store = app.state.store
     v1_path = store.version_info()["path"]
 
-    # simulate an in-flight query on version 1
-    pinned = store.pin("test-inst")
+    # simulate an in-flight query on version 1 (pinned by this process's boot)
+    pinned = store.pin("test-inst", app.state.boot_id)
     assert pinned[0] == 1
     ref_id = pinned[3]
 
@@ -90,12 +90,13 @@ def test_dead_instances_pins_do_not_block_reclaim(client, app):
     store = app.state.store
     v1_path = store.version_info()["path"]
 
-    # a ref owned by an instance that died without unpinning
+    # a ref owned by a process boot that died without unpinning
     now = time.time()
-    store.heartbeat("ghost", now - 1000)  # long past dead_after
+    store.heartbeat("ghost-boot", "ghost", now - 1000)  # long past dead_after
     with store._txn() as con:
         con.execute(
-            "INSERT INTO refs(version, instance, created_at) VALUES (1, 'ghost', ?)",
+            "INSERT INTO refs(version, instance, boot_id, created_at) "
+            "VALUES (1, 'ghost', 'ghost-boot', ?)",
             (now - 1000,),
         )
     upload(client, vcf([(500, "A", "G")]), base_version=1)

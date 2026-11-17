@@ -3,7 +3,13 @@ services:
     build: .
     environment:
       VCF_DATA_DIR: /data
-      VCF_INSTANCE_ID: app1
+      # Both containers deliberately share one VCF_INSTANCE_ID — this is the
+      # rolling-replacement overlap window (old and new processes serving at
+      # once). Ownership is keyed per process boot, so concurrent uploads,
+      # pins and shutdowns stay isolated. Replace one container at a time
+      # (e.g. `docker compose up -d --no-deps --build app1`) to rehearse the
+      # handover against a live peer.
+      VCF_INSTANCE_ID: vcf
     volumes:
       - vcfdata:/data
     ports:
@@ -13,7 +19,7 @@ services:
     build: .
     environment:
       VCF_DATA_DIR: /data
-      VCF_INSTANCE_ID: app2
+      VCF_INSTANCE_ID: vcf
     volumes:
       - vcfdata:/data
     ports:

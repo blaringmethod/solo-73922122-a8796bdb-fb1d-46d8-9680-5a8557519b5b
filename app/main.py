@@ -4,13 +4,20 @@ Layout of the shared data directory:
 
     <data_dir>/meta.sqlite3          metadata, current-version pointer, ref pins
     <data_dir>/versions/<uuid>/      published file sets (variants.vcf.gz + .tbi)
-    <data_dir>/staging/<instance>/<uuid>/   in-progress builds
+    <data_dir>/staging/<boot_id>/<uuid>/   in-progress builds
 
 Publishing is atomic: the file set is completed in staging, renamed into
 versions/, and only then the current-version pointer is flipped inside one
 SQLite transaction. Readers pin a version before opening its files, so an
 in-flight query keeps its (version, data, index) trio consistent while a
 replacement is published; the reaper frees old files once no pin remains.
+
+Rolling replacement: the old and new processes may briefly share one
+VCF_INSTANCE_ID, so ownership (staging dirs, heartbeats, query pins) is keyed
+by a per-process-boot token, never by the configured instance id. The new
+process's startup touches only its own fresh staging dir, and the old
+process's shutdown releases only its own rows — in-flight uploads and pinned
+queries on the other side of the handover are undisturbed.
 """
 from __future__ import annotations
 
@@ -61,11 +68,17 @@ def create_app(config: Config | None = None) -> FastAPI:
     store = Store(os.path.join(cfg.data_dir, "meta.sqlite3"))
     versions_dir = os.path.join(cfg.data_dir, "versions")
     staging_base = os.path.join(cfg.data_dir, "staging")
-    staging_root = os.path.join(staging_base, cfg.instance_id)
+    # Unique token for this process boot. A rolling replacement briefly runs
+    # two processes under the same VCF_INSTANCE_ID; keying ownership by boot
+    # (not by instance id) is what keeps the handover safe.
+    boot_id = f"{cfg.instance_id}-{uuid.uuid4().hex}"
+    staging_root = os.path.join(staging_base, boot_id)
     os.makedirs(versions_dir, exist_ok=True)
-    # Leftover builds of a previous incarnation of this instance can never be
-    # published any more; drop them before serving.
-    shutil.rmtree(staging_root, ignore_errors=True)
+    # This boot's staging dir is fresh by construction — nothing to clean.
+    # Crucially, startup must NOT delete anything else: staging dirs of the
+    # still-running previous process hold uploads it will legitimately
+    # publish. Leftovers of processes that really exited stay untouched here
+    # and are swept by the reaper after the orphan grace period instead.
     os.makedirs(staging_root, exist_ok=True)
 
     def reap_once() -> None:
@@ -85,27 +98,28 @@ def create_app(config: Config | None = None) -> FastAPI:
                 continue
             if rel not in known and old:
                 shutil.rmtree(path, ignore_errors=True)
-        # 3) FS: sweep staging dirs of dead instances.
-        live = store.live_instances(now, cfg.dead_after)
-        for inst in os.listdir(staging_base):
-            path = os.path.join(staging_base, inst)
+        # 3) FS: sweep staging dirs of dead boots (incl. never-registered
+        # leftovers) once they are older than the orphan grace period.
+        live = store.live_boots(now, cfg.dead_after)
+        for boot in os.listdir(staging_base):
+            path = os.path.join(staging_base, boot)
             try:
                 old = os.path.getmtime(path) < cutoff
             except OSError:
                 continue
-            if inst not in live and old:
+            if boot not in live and old:
                 shutil.rmtree(path, ignore_errors=True)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        store.heartbeat(cfg.instance_id, time.time())
+        store.heartbeat(boot_id, cfg.instance_id, time.time())
         stopped = asyncio.Event()
 
         async def heartbeat_loop():
             while not stopped.is_set():
                 await asyncio.sleep(cfg.heartbeat_interval)
                 try:
-                    store.heartbeat(cfg.instance_id, time.time())
+                    store.heartbeat(boot_id, cfg.instance_id, time.time())
                 except Exception:
                     pass
 
@@ -130,7 +144,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             try:
-                store.unregister(cfg.instance_id)
+                # Release only this boot's pins and heartbeat row. A previous
+                # process exiting here must not drop the replacement's pins.
+                store.unregister(boot_id)
             except Exception:
                 pass
 
@@ -150,6 +166,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.state.cfg = cfg
     app.state.store = store
     app.state.reap_once = reap_once
+    app.state.boot_id = boot_id
+    app.state.staging_root = staging_root
 
     @app.get("/", include_in_schema=False)
     def root():
@@ -211,7 +229,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     ):
         if end < start:
             raise HTTPException(400, "end must be >= start")
-        pinned = store.pin(cfg.instance_id, time.time())
+        pinned = store.pin(cfg.instance_id, boot_id, time.time())
         if pinned is None:
             raise HTTPException(404, "no VCF has been published yet")
         version, vchrom, rel, ref_id = pinned
